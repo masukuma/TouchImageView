@@ -57,7 +57,7 @@ flowchart LR
   Q --> P[Preprocess<br/>page detect · orient · dewarp · normalise]
   P --> R[Template registration<br/>homography → canonical form]
   R --> X1[Reader A<br/>field crops → digit recogniser]
-  R --> X2[Reader B<br/>independent vision model]
+  R --> X2[Reader B<br/>Ollama Cloud vision model<br/>qwen3-vl]
   R --> X3[Printed OCR<br/>serial · codes · names]
   X1 & X2 & X3 --> V[Reconcile + validate]
   V -->|all agree, all checks pass| T[(Results store<br/>event-sourced)]
@@ -116,8 +116,13 @@ Two **independent** readers per numeric field. Independence matters: if they mak
 - Model: a small CRNN with CTC over the digit alphabet `0-9` plus blank. It is trained on synthetic handwritten digits rendered onto real form backgrounds, then fine-tuned on hand-labelled crops from real forms.
 - Output: digit string plus per-character confidence. Strings that are not 1–3 digits are treated as unreadable.
 
-**Reader B: general vision model**
-- Input: the dewarped full page, with a prompt that asks for a fixed JSON schema (the same fields as `sample-forms.json`). Example: a Claude model with a structured-output tool definition.
+**Reader B: Ollama Cloud vision model**
+- Model: a vision-capable Ollama Cloud model, by default `qwen3-vl:235b-cloud` (Qwen3-VL; Ollama Cloud also hosts vision variants of Ministral 3 and Mistral Large 3, which are candidates for evaluation). The model tag is configuration, not code, so the model can be swapped after golden-set evaluation.
+- Call: Ollama's `/api/chat` endpoint against the cloud host (`https://ollama.com`, authenticated with an `OLLAMA_API_KEY` bearer token), with the image as base64 in the message's `images` field. Use `/api/chat`, not `/api/generate`, which has been reported to ignore images for cloud models. `temperature: 0`.
+- Input: two images per call: the dewarped full page (for context and the printed header) and a higher-resolution crop of the registered candidate table + polling station counts. Vision models downscale large inputs, and the crop keeps the handwritten digits legible.
+- Output: JSON with the same fields as `sample-forms.json`, plus a per-field `legible` flag. Ollama's docs state that structured outputs (the `format` JSON schema parameter) are not supported for cloud models, so the schema is given in the prompt, and the response is parsed and validated against the JSON schema by the worker. Invalid JSON or a schema failure → one retry, then the whole form is `unreadable` for Reader B. Once Ollama Cloud supports `format`, pass the schema there too.
+- Recorded with every reading: model tag, the model digest returned by the API (if any), prompt version, and raw response. A cloud model can change behind the same tag, so a change in digest triggers a golden-set re-run before results from the new version can auto-verify.
+- Same client, two backends: because a self-hosted Ollama server exposes the same API, a local `qwen3-vl` (a smaller size on a GPU node) is the fallback when the cloud quota is exhausted, the service is unreachable, or data-residency rules forbid sending images out (see §7). The backend used is recorded on each reading.
 - Seeing the whole form gives it context that Reader A lacks, e.g. reading a smudged total from the sum of the candidate votes. This is also a risk, because it can "correct" a field that is genuinely inconsistent. To control that, the prompt says to transcribe exactly what is written, never to compute, and to return `null` for illegible fields.
 
 **Printed OCR** (serial, codes, station name): standard OCR (Tesseract or a cloud OCR) on the registered printed fields. The result is checked against the master register. The serial number is printed in a known font at a known place, so accuracy is very high.
@@ -222,7 +227,7 @@ AuditEvent(id, actor, action, entity, payload, at, prev_hash)               -- h
 
 | Concern | Approach |
 |---|---|
-| **Scale** | About 46,000 streams nationally × 1–3 images each, most of which arrive in a 6–12 h window. That is about 2–5 images/s at peak and under 300 GB of images. The pipeline is queue-based and autoscaled. GPU is needed only for Reader A and is optional (a CPU CRNN is fast enough at this rate). Reader B is rate-limited by the API quota, so it needs a reserved quota and a backlog alert. |
+| **Scale** | About 46,000 streams nationally × 1–3 images each, most of which arrive in a 6–12 h window. That is about 2–5 images/s at peak and under 300 GB of images. The pipeline is queue-based and autoscaled. GPU is needed only for Reader A and is optional (a CPU CRNN is fast enough at this rate). Reader B is limited by the Ollama Cloud plan's usage limits, so it needs a plan sized for the peak, a backlog alert, and automatic failover to the self-hosted Ollama backend when the backlog or error rate passes a threshold. |
 | **Latency** | Target: image → auto-verified result in under 2 minutes at p95. The human queue is sized so that 15–25% of forms can be routed (worse at first, improving as models are tuned). |
 | **Integrity** | Signed uploads, WORM originals, hash-chained audit log, no in-place edits, role-based access (field officer / verifier / supervisor / admin). Two-person rule for supervisor overrides. |
 | **Availability** | Multi-AZ. The ingest API accepts and stores uploads even if every downstream stage is down. |
@@ -248,4 +253,5 @@ AuditEvent(id, actor, action, entity, payload, at, prev_hash)               -- h
 - Is the registered voter figure on Form 34A meant to be per stream or per station? This decides whether V6 is a warning or informational (see the Mwaroni example).
 - Is there an official allocation of form serial numbers to stations (booklet issue records)? If so, V5 can become "serial belongs to this station's booklet".
 - Redaction policy for agent personal data in public images.
-- Is an external vision model (Reader B) acceptable under data-residency rules, or does it need to be self-hosted?
+- Is sending form images to Ollama Cloud (Reader B) acceptable under data-residency and election rules? If not, Reader B runs only on the self-hosted Ollama backend, which needs GPU capacity sized for the peak.
+- Which Ollama Cloud vision model reads handwritten digits best on these forms? Run `qwen3-vl:235b-cloud` and the other cloud vision models against the golden set before choosing.
